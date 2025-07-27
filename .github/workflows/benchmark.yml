@@ -1,0 +1,377 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - '**.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'benchmarks/**'
+  pull_request:
+    branches: [ master, develop ]
+    paths:
+      - '**.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'benchmarks/**'
+  workflow_dispatch:
+    inputs:
+      compare_branch:
+        description: 'Branch to compare against (for PR benchmarks)'
+        required: false
+        default: 'master'
+
+# Cancel in-progress benchmark runs
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  deployments: write
+
+env:
+  UV_CACHE_DIR: /tmp/.uv-cache
+  PYTHON_VERSION: "3.12"
+  UV_VERSION: "0.5.9"
+
+jobs:
+  benchmark:
+    name: Performance Benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      
+      - name: Checkout base branch for comparison
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin ${{ github.event.pull_request.base.ref }}:base-branch
+          echo "BASE_REF=base-branch" >> $GITHUB_ENV
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+          version: ${{ env.UV_VERSION }}
+      
+      - name: Restore benchmark cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.UV_CACHE_DIR }}
+            .pytest_cache
+            .benchmarks
+          key: benchmark-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            benchmark-${{ runner.os }}-
+      
+      - name: Install dependencies
+        run: |
+          uv sync --all-extras --dev
+          uv pip install pytest-benchmark[histogram] pytest-codspeed memory-profiler py-spy
+      
+      - name: Setup benchmark infrastructure
+        run: |
+          # Create benchmarks directory if it doesn't exist
+          mkdir -p benchmarks
+          
+          # Create __init__.py
+          touch benchmarks/__init__.py
+          
+          # If no benchmark tests exist yet, create CRISP-specific benchmarks
+          if [ ! -f benchmarks/test_crisp_benchmark.py ]; then
+            cat > benchmarks/test_crisp_benchmark.py << 'EOF'
+import pytest
+import time
+import numpy as np
+from typing import List
+
+# Import CRISP modules when available
+try:
+    import sys
+    sys.path.insert(0, '.')
+    from crisp import CRISPProcessor  # Replace with actual CRISP imports
+except ImportError:
+    # Mock for demo purposes
+    class CRISPProcessor:
+        def process(self, data): 
+            time.sleep(0.001)
+            return data
+
+@pytest.fixture
+def sample_data():
+    """Generate sample data for benchmarks"""
+    return np.random.rand(1000, 100)
+
+def test_crisp_processing_speed(benchmark, sample_data):
+    """Benchmark CRISP processing speed"""
+    processor = CRISPProcessor()
+    result = benchmark(processor.process, sample_data)
+    assert result is not None
+
+@pytest.mark.benchmark(group="memory")
+def test_memory_efficiency(benchmark):
+    """Benchmark memory usage patterns"""
+    def memory_intensive_operation():
+        data = []
+        for i in range(100):
+            data.append(np.random.rand(100, 100))
+        return len(data)
+    
+    result = benchmark(memory_intensive_operation)
+    assert result == 100
+
+@pytest.mark.benchmark(group="algorithms")
+def test_algorithm_complexity(benchmark):
+    """Benchmark algorithm performance"""
+    def algorithm_test(n=1000):
+        # Simulate O(n log n) algorithm
+        data = list(range(n))
+        return sorted(data, reverse=True)
+    
+    result = benchmark(algorithm_test)
+    assert len(result) == 1000
+EOF
+          fi
+        working-directory: crisp-py
+      
+      - name: Run benchmarks
+        run: |
+          # Run benchmarks with detailed output
+          uv run pytest benchmarks/ \
+            -v \
+            --benchmark-only \
+            --benchmark-json=benchmark-results.json \
+            --benchmark-autosave \
+            --benchmark-save-data \
+            --benchmark-warmup=on \
+            --benchmark-disable-gc \
+            --benchmark-histogram=benchmark-histogram
+        working-directory: crisp-py
+      
+      - name: Compare with base branch
+        if: github.event_name == 'pull_request'
+        run: |
+          # Checkout and run benchmarks on base branch
+          git checkout ${{ env.BASE_REF }}
+          uv sync --all-extras --dev
+          uv run pytest benchmarks/ \
+            --benchmark-only \
+            --benchmark-json=base-benchmark-results.json \
+            --benchmark-warmup=on
+          
+          # Compare results
+          git checkout -
+          uv run pytest-benchmark compare \
+            base-benchmark-results.json \
+            benchmark-results.json \
+            --csv=benchmark-comparison.csv \
+            --histogram=benchmark-comparison-histogram
+        working-directory: crisp-py
+      
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Python Benchmark
+          tool: 'pytest'
+          output-file-path: crisp-py/benchmark-results.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          comment-on-alert: true
+          alert-threshold: '110%'  # Alert on 10% regression
+          comment-always: ${{ github.event_name == 'pull_request' }}
+          fail-on-alert: false
+          summary-always: true
+          benchmark-data-dir-path: 'dev/bench'
+      
+      - name: Profile memory and CPU usage
+        run: |
+          # Create profiling script if it doesn't exist
+          if [ ! -f benchmarks/profile_crisp.py ]; then
+            cat > benchmarks/profile_crisp.py << 'EOF'
+from memory_profiler import profile
+import cProfile
+import pstats
+import io
+
+# Import CRISP modules when available
+try:
+    from crisp import CRISPProcessor
+except ImportError:
+    class CRISPProcessor:
+        def process(self, data):
+            import time
+            time.sleep(0.01)
+            return sum(data) if hasattr(data, '__iter__') else data
+
+@profile
+def memory_intensive_crisp():
+    """Profile memory usage of CRISP operations"""
+    processor = CRISPProcessor()
+    data_chunks = []
+    
+    # Simulate processing multiple data chunks
+    for i in range(10):
+        chunk = list(range(10000))
+        processed = processor.process(chunk)
+        data_chunks.append(processed)
+    
+    return len(data_chunks)
+
+def cpu_intensive_crisp():
+    """Profile CPU usage of CRISP operations"""
+    processor = CRISPProcessor()
+    results = []
+    
+    for i in range(100):
+        data = list(range(1000))
+        result = processor.process(data)
+        results.append(result)
+    
+    return results
+
+if __name__ == "__master__":
+    print("=== Memory Profile ===")
+    memory_intensive_crisp()
+    
+    print("\n=== CPU Profile ===")
+    profiler = cProfile.Profile()
+    profiler.enable()
+    cpu_intensive_crisp()
+    profiler.disable()
+    
+    s = io.StringIO()
+    ps = pstats.Stats(profiler, stream=s).sort_stats('cumulative')
+    ps.print_stats(20)
+    print(s.getvalue())
+EOF
+          fi
+          
+          # Run profiling
+          echo "## Performance Profiling Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Memory profiling
+          echo "### Memory Usage Profile" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          uv run python -m memory_profiler benchmarks/profile_crisp.py 2>&1 | head -50 >> $GITHUB_STEP_SUMMARY || echo "Memory profiling not available" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          # CPU profiling with py-spy
+          echo "### CPU Usage Profile" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          sudo uv run py-spy record -d 5 -o profile.svg -- python benchmarks/profile_crisp.py || echo "CPU profiling not available" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        working-directory: crisp-py
+      
+      - name: Upload profiling artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-profiles
+          path: |
+            crisp-py/benchmark-*.json
+            crisp-py/benchmark-*.csv
+            crisp-py/benchmark-*histogram*
+            crisp-py/memory-report.txt
+            crisp-py/profile.svg
+          retention-days: 7
+      
+      - name: Comment benchmark results on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            
+            let comment = '## 📊 Benchmark Results\n\n';
+            
+            try {
+              const benchmarkData = JSON.parse(fs.readFileSync('crisp-py/benchmark-results.json', 'utf8'));
+              
+              comment += '### Performance Metrics\n\n';
+              comment += '| Test | Min | Max | Mean | StdDev | Median | IQR | Outliers | Rounds |\n';
+              comment += '|------|-----|-----|------|--------|--------|-----|----------|--------|\n';
+              
+              for (const benchmark of benchmarkData.benchmarks) {
+                const stats = benchmark.stats;
+                comment += `| ${benchmark.name} | ${stats.min.toFixed(6)}s | ${stats.max.toFixed(6)}s | ${stats.mean.toFixed(6)}s | ${stats.stddev.toFixed(6)}s | ${stats.median.toFixed(6)}s | ${stats.iqr.toFixed(6)}s | ${stats.outliers} | ${stats.rounds} |\n`;
+              }
+              
+              comment += '\n';
+            } catch (e) {
+              comment += 'No benchmark data available.\n';
+            }
+            
+            // Find and update or create comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && comment.body.includes('📊 Benchmark Results')
+            );
+            
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: comment
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            }
+  
+  codspeed:
+    name: CodSpeed Performance Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      
+      - name: Install dependencies
+        run: |
+          uv sync --all-extras --dev
+          uv pip install pytest-codspeed
+      
+      - name: Run CodSpeed benchmarks
+        uses: CodSpeedHQ/action@v3
+        with:
+          token: ${{ secrets.CODSPEED_TOKEN }}
+          run: cd crisp-py && uv run pytest benchmarks/ --codspeed

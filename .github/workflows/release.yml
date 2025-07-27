@@ -1,0 +1,359 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.0.0)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Perform a dry run (no actual release)'
+        required: false
+        type: boolean
+        default: false
+
+# Prevent concurrent releases
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write  # For trusted publishing to PyPI
+
+env:
+  PYTHON_VERSION: "3.12"
+  UV_VERSION: "0.5.9"
+
+jobs:
+  validate-version:
+    name: Validate Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is-prerelease: ${{ steps.version.outputs.is-prerelease }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      
+      - name: Validate and determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION="${{ github.event.inputs.version }}"
+          fi
+          
+          # Validate version format
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+(\.[0-9]+)?)?$ ]]; then
+            echo "❌ Invalid version format: $VERSION"
+            echo "Version must follow semantic versioning (e.g., 1.0.0, 1.0.0-alpha.1)"
+            exit 1
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          
+          # Check if it's a pre-release
+          if [[ "$VERSION" =~ -(alpha|beta|rc|dev|pre) ]]; then
+            echo "is-prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "is-prerelease=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Check if tag already exists
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "⚠️ Warning: Tag v$VERSION already exists"
+            if [ "${{ github.event.inputs.dry_run }}" != "true" ]; then
+              echo "❌ Cannot create release for existing tag in non-dry-run mode"
+              exit 1
+            fi
+          fi
+          
+          echo "## Version Information" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: $VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "- **Pre-release**: $([[ "$VERSION" =~ -(alpha|beta|rc|dev|pre) ]] && echo "Yes" || echo "No")" >> $GITHUB_STEP_SUMMARY
+          echo "- **Dry Run**: ${{ github.event.inputs.dry_run || 'false' }}" >> $GITHUB_STEP_SUMMARY
+  
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    needs: validate-version
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+          version: ${{ env.UV_VERSION }}
+      
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.uv-cache
+          key: release-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            release-${{ runner.os }}-
+      
+      - name: Install dependencies
+        run: |
+          uv sync --all-extras --dev
+          uv pip install build twine wheel setuptools
+      
+      - name: Run full test suite
+        run: |
+          echo "::group::Running tests"
+          make test
+          echo "::endgroup::"
+          
+          echo "::group::Running linting"
+          make lint
+          echo "::endgroup::"
+          
+          echo "::group::Running type checking"
+          make check
+          echo "::endgroup::"
+      
+      - name: Update version in pyproject.toml
+        run: |
+          # Update version if needed
+          CURRENT_VERSION=$(grep "^version" pyproject.toml | cut -d'"' -f2)
+          TARGET_VERSION="${{ needs.validate-version.outputs.version }}"
+          
+          if [ "$CURRENT_VERSION" != "$TARGET_VERSION" ]; then
+            echo "Updating version from $CURRENT_VERSION to $TARGET_VERSION"
+            sed -i "s/^version = \".*\"/version = \"$TARGET_VERSION\"/" pyproject.toml
+          fi
+      
+      - name: Build distributions
+        run: |
+          echo "::group::Building package"
+          uv build --verify-hashes
+          echo "::endgroup::"
+          
+          # Display build artifacts
+          echo "## Build Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -la dist/ >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+      
+      - name: Verify distribution
+        run: |
+          # Check with twine
+          uv run twine check --strict dist/*
+          
+          # Verify wheel contents
+          echo "::group::Wheel contents"
+          uv run python -m zipfile -l dist/*.whl | head -30
+          echo "::endgroup::"
+          
+          # Test installation in clean environment
+          echo "::group::Test installation"
+          python -m venv test-env
+          test-env/bin/pip install dist/*.whl
+          test-env/bin/python -c "import crisp; print(f'Successfully imported crisp version {crisp.__version__}')"
+          rm -rf test-env
+          echo "::endgroup::"
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+          retention-days: 7
+  
+  publish-pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: [validate-version, build-and-test]
+    if: github.event.inputs.dry_run != 'true'
+    environment:
+      name: pypi
+      url: https://pypi.org/project/crisp-py/${{ needs.validate-version.outputs.version }}/
+    
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+      
+      - name: Display artifacts
+        run: |
+          echo "## Artifacts to publish" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -la dist/ >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+      
+      - name: Publish to Test PyPI first
+        if: needs.validate-version.outputs.is-prerelease == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          password: ${{ secrets.TEST_PYPI_API_TOKEN }}
+          skip-existing: true
+          verbose: true
+        continue-on-error: true
+      
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
+          verbose: true
+          print-hash: true
+  
+  create-github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [validate-version, build-and-test, publish-pypi]
+    if: github.event.inputs.dry_run != 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+      
+      - name: Generate changelog
+        id: changelog
+        run: |
+          VERSION="${{ needs.validate-version.outputs.version }}"
+          
+          # Generate changelog header
+          echo "# CRISP Python v$VERSION" > RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "Released on $(date -u +"%Y-%m-%d")" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          
+          # Add warning for pre-releases
+          if [ "${{ needs.validate-version.outputs.is-prerelease }}" == "true" ]; then
+            echo "> ⚠️ **This is a pre-release version and may contain unstable features.**" >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+          fi
+          
+          echo "## 📋 What's Changed" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          
+          # Get commits since last tag
+          LAST_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$LAST_TAG" ]; then
+            # Group commits by type
+            echo "### ✨ Features" >> RELEASE_NOTES.md
+            git log $LAST_TAG..HEAD --grep="feat:" --pretty=format:"* %s (%h)" >> RELEASE_NOTES.md || echo "" >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+            
+            echo "### 🐛 Bug Fixes" >> RELEASE_NOTES.md
+            git log $LAST_TAG..HEAD --grep="fix:" --pretty=format:"* %s (%h)" >> RELEASE_NOTES.md || echo "" >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+            
+            echo "### 📚 Documentation" >> RELEASE_NOTES.md
+            git log $LAST_TAG..HEAD --grep="docs:" --pretty=format:"* %s (%h)" >> RELEASE_NOTES.md || echo "" >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+            
+            echo "### 🔧 Other Changes" >> RELEASE_NOTES.md
+            git log $LAST_TAG..HEAD --invert-grep --grep="feat:\|fix:\|docs:" --pretty=format:"* %s (%h)" >> RELEASE_NOTES.md || echo "" >> RELEASE_NOTES.md
+          else
+            git log --pretty=format:"* %s (%h)" -n 20 >> RELEASE_NOTES.md
+          fi
+          
+          echo "" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "## 📦 Installation" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo '```bash' >> RELEASE_NOTES.md
+          echo "pip install crisp-py==$VERSION" >> RELEASE_NOTES.md
+          echo '```' >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "## 📄 Checksums" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo '```' >> RELEASE_NOTES.md
+          cd dist && sha256sum * >> ../RELEASE_NOTES.md
+          cd ..
+          echo '```' >> RELEASE_NOTES.md
+      
+      - name: Create Release Tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git tag -a "v${{ needs.validate-version.outputs.version }}" -m "Release v${{ needs.validate-version.outputs.version }}"
+          git push origin "v${{ needs.validate-version.outputs.version }}"
+      
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.validate-version.outputs.version }}
+          name: v${{ needs.validate-version.outputs.version }}
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: ${{ needs.validate-version.outputs.is-prerelease == 'true' }}
+          files: |
+            dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: false  # We generate our own
+  
+  post-release:
+    name: Post-Release Tasks
+    runs-on: ubuntu-latest
+    needs: [validate-version, create-github-release]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      
+      - name: Verify PyPI release
+        run: |
+          # Wait a bit for PyPI to update
+          sleep 30
+          
+          # Check if package is available
+          pip index versions crisp-py || echo "Package not yet available on PyPI"
+      
+      - name: Create release summary
+        run: |
+          echo "## 🎉 Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version**: v${{ needs.validate-version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Type**: ${{ needs.validate-version.outputs.is-prerelease == 'true' && 'Pre-release' || 'Stable Release' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Published to:" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ PyPI: https://pypi.org/project/crisp-py/${{ needs.validate-version.outputs.version }}/" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ GitHub Releases: ${{ github.server_url }}/${{ github.repository }}/releases/tag/v${{ needs.validate-version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📥 Installation:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "pip install crisp-py==${{ needs.validate-version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

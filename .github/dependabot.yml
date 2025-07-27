@@ -1,0 +1,54 @@
+version: 2
+updates:
+  # Keep GitHub Actions up to date
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+    assignees:
+      - "sigridjineth"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    open-pull-requests-limit: 5
+    
+  # Keep Python dependencies up to date
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+    assignees:
+      - "sigridjineth"
+    labels:
+      - "dependencies"
+      - "python"
+    open-pull-requests-limit: 10
+    ignore:
+      # Add any dependencies you want to pin or ignore updates for
+      # - dependency-name: "numpy"
+      #   versions: ["2.x"]
+    groups:
+      # Group all development dependencies together
+      development-dependencies:
+        patterns:
+          - "pytest*"
+          - "flake8*"
+          - "black"
+          - "isort"
+          - "mypy"
+          - "coverage*"
+        update-types:
+          - "minor"
+          - "patch"
+      
+      # Group all type stubs together
+      type-stubs:
+        patterns:
+          - "types-*"
+        update-types:
+          - "minor"
+          - "patch"

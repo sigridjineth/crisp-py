@@ -1,0 +1,177 @@
+name: Type Check
+
+on:
+  push:
+    branches: [ master, develop ]
+    paths:
+      - '**.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/type-check.yml'
+  pull_request:
+    branches: [ master, develop ]
+    paths:
+      - '**.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/type-check.yml'
+  workflow_dispatch:
+
+env:
+  UV_CACHE_DIR: /tmp/.uv-cache
+
+jobs:
+  mypy:
+    name: MyPy Type Check - Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      
+      - name: Set up cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/.uv-cache
+            .mypy_cache
+          key: mypy-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            mypy-${{ runner.os }}-py${{ matrix.python-version }}-
+            mypy-${{ runner.os }}-
+      
+      - name: Install dependencies
+        run: |
+          uv sync --all-extras --dev
+          uv pip install mypy types-requests types-setuptools
+      
+      - name: Run MyPy
+        id: mypy
+        run: |
+          echo "::group::Running MyPy type checker"
+          uv run mypy . --install-types --non-interactive --show-error-codes --show-column-numbers --pretty
+          echo "::endgroup::"
+        working-directory: crisp-py
+        continue-on-error: true
+      
+      - name: Generate MyPy report
+        if: always()
+        run: |
+          # Run mypy with different output formats for reporting
+          uv run mypy . --html-report mypy-report --txt-report mypy-report --install-types --non-interactive || true
+          
+          # Generate summary
+          echo "## MyPy Type Check Results - Python ${{ matrix.python-version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.mypy.outcome }}" == "success" ]; then
+            echo "✅ **All type checks passed!**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Type errors found**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Error Summary" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            uv run mypy . --no-error-summary 2>&1 | head -50 >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "See the full report in the artifacts." >> $GITHUB_STEP_SUMMARY
+          fi
+        working-directory: crisp-py
+      
+      - name: Upload MyPy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mypy-report-python-${{ matrix.python-version }}
+          path: crisp-py/mypy-report/
+      
+      - name: Annotate files with MyPy errors
+        if: steps.mypy.outcome == 'failure'
+        run: |
+          # Parse mypy output and create GitHub annotations
+          uv run mypy . --no-error-summary --show-absolute-path 2>&1 | python -c "
+import sys
+import re
+import os
+
+for line in sys.stdin:
+    match = re.match(r'^(.+):(\d+):(\d+): (error|warning|note): (.+)$', line.strip())
+    if match:
+        file_path, line_num, col_num, level, message = match.groups()
+        # Make path relative to workspace
+        rel_path = os.path.relpath(file_path, os.environ.get('GITHUB_WORKSPACE', '.'))
+        # GitHub annotation format
+        annotation_level = 'error' if level == 'error' else 'warning'
+        print(f'::{annotation_level} file={rel_path},line={line_num},col={col_num}::{message}')
+" || true
+        working-directory: crisp-py
+      
+      - name: Fail if type errors found
+        if: steps.mypy.outcome == 'failure'
+        run: |
+          echo "❌ Type checking failed!"
+          echo "Please fix the type errors before merging."
+          exit 1
+  
+  pyright:
+    name: Pyright Type Check (Optional)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      
+      - name: Install dependencies
+        run: |
+          uv sync --all-extras --dev
+          uv pip install pyright
+      
+      - name: Run Pyright
+        run: |
+          echo "::group::Running Pyright type checker (informational only)"
+          uv run pyright || true
+          echo "::endgroup::"
+        working-directory: crisp-py
+      
+      - name: Upload Pyright report
+        if: always()
+        run: |
+          uv run pyright --outputjson > pyright-report.json || true
+          echo "## Pyright Results (Informational)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Pyright check completed. This is informational only and won't fail the build." >> $GITHUB_STEP_SUMMARY
+        working-directory: crisp-py
+      
+      - name: Upload Pyright JSON report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyright-report
+          path: crisp-py/pyright-report.json

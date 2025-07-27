@@ -1,0 +1,416 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, develop ]
+  pull_request:
+    branches: [ master, develop ]
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        type: boolean
+        description: 'Run the build with tmate debugging enabled'
+        required: false
+        default: false
+
+# Cancel in-progress runs when a new run is triggered
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_CACHE_DIR: /tmp/.uv-cache
+  PYTHON_VERSION: "3.12"
+  UV_VERSION: "0.5.9"  # Pin UV version for consistency
+  PYTEST_TIMEOUT: 300  # 5 minutes timeout for tests
+
+jobs:
+  test:
+    name: Test Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false  # Continue running other matrix jobs if one fails
+      matrix:
+        python-version: ["3.11", "3.12"]
+        os: [ubuntu-latest]
+        include:
+          - python-version: "3.12"
+            os: macos-latest
+          - python-version: "3.12"
+            os: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false  # Security best practice
+      
+      # Enable tmate debugging if requested
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
+        with:
+          limit-access-to-actor: true
+      
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'  # Built-in pip caching
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+          version: ${{ env.UV_VERSION }}
+      
+      - name: Restore uv cache
+        uses: actions/cache@v4
+        id: uv-cache
+        with:
+          path: ${{ env.UV_CACHE_DIR }}
+          key: uv-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-py${{ matrix.python-version }}-
+            uv-${{ runner.os }}-
+      
+      - name: Install dependencies
+        run: |
+          uv sync --all-extras --dev
+          uv pip install coverage[toml] pytest-cov pytest-timeout pytest-xdist
+      
+      - name: Run tests with coverage
+        run: |
+          uv run pytest tests/ \
+            --cov=crisp \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-report=term-missing \
+            --timeout=${{ env.PYTEST_TIMEOUT }} \
+            -n auto \
+            -v
+        working-directory: crisp-py
+        env:
+          PYTHONPATH: ${{ github.workspace }}/crisp-py
+          PYTEST_XDIST_AUTO_NUM_WORKERS: 2  # Limit parallel workers
+      
+      - name: Generate test report
+        if: always()
+        run: |
+          echo "## Test Results - ${{ matrix.os }} / Python ${{ matrix.python-version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f .coverage ]; then
+            echo "### Coverage Summary" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            uv run coverage report | tail -n 10 >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Upload coverage reports
+        if: matrix.os == 'ubuntu-latest'  # Only upload from Linux runs
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-python-${{ matrix.python-version }}
+          path: |
+            crisp-py/coverage.xml
+            crisp-py/htmlcov/
+          retention-days: 5
+      
+      - name: Upload coverage to Codecov
+        if: matrix.os == 'ubuntu-latest' && github.event_name != 'workflow_dispatch'
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./crisp-py/coverage.xml
+          flags: unittests,py${{ matrix.python-version }}
+          name: coverage-py${{ matrix.python-version }}
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+  
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+          version: ${{ env.UV_VERSION }}
+      
+      - name: Restore uv cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.UV_CACHE_DIR }}
+          key: uv-lint-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-lint-${{ runner.os }}-
+      
+      - name: Install dependencies
+        run: |
+          uv sync --all-extras --dev
+          uv pip install flake8 black isort
+      
+      - name: Run linting
+        id: lint
+        run: |
+          echo "::group::Running linters"
+          make lint || echo "lint-failed=true" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+        continue-on-error: true
+      
+      - name: Generate lint report
+        if: steps.lint.outputs.lint-failed == 'true'
+        run: |
+          echo "## Linting Failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Please run \`make format\` locally to fix formatting issues." >> $GITHUB_STEP_SUMMARY
+      
+      - name: Fail on lint errors
+        if: steps.lint.outputs.lint-failed == 'true'
+        run: exit 1
+  
+  type-check:
+    name: Type Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+          version: ${{ env.UV_VERSION }}
+      
+      - name: Restore caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.UV_CACHE_DIR }}
+            .mypy_cache
+          key: uv-typecheck-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-typecheck-${{ runner.os }}-
+      
+      - name: Install dependencies
+        run: |
+          uv sync --all-extras --dev
+          uv pip install mypy types-requests
+      
+      - name: Run type checking
+        run: make check
+  
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+          version: ${{ env.UV_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          uv sync --all-extras --dev
+          uv pip install bandit[toml] safety pip-audit semgrep
+      
+      - name: Run Bandit security scan
+        id: bandit
+        run: |
+          echo "::group::Running Bandit"
+          uv run bandit -r crisp/ -f json -o bandit-report.json || echo "bandit-issues=true" >> $GITHUB_OUTPUT
+          uv run bandit -r crisp/ -f txt || true
+          echo "::endgroup::"
+        working-directory: crisp-py
+      
+      - name: Check for known vulnerabilities with safety
+        id: safety
+        run: |
+          echo "::group::Running Safety check"
+          uv run safety check --json --output safety-report.json || echo "safety-issues=true" >> $GITHUB_OUTPUT
+          uv run safety check || true
+          echo "::endgroup::"
+      
+      - name: Run pip-audit
+        id: pip-audit
+        run: |
+          echo "::group::Running pip-audit"
+          uv run pip-audit --desc || echo "audit-issues=true" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+      
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/python
+            p/owasp-top-ten
+        continue-on-error: true
+      
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            safety-report.json
+          retention-days: 5
+      
+      - name: Create security summary
+        if: always()
+        run: |
+          echo "## Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.bandit.outputs.bandit-issues }}" == "true" ]; then
+            echo "⚠️ Bandit found security issues" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ Bandit scan passed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ steps.safety.outputs.safety-issues }}" == "true" ]; then
+            echo "⚠️ Safety found vulnerable dependencies" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ No known vulnerabilities in dependencies" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ steps.pip-audit.outputs.audit-issues }}" == "true" ]; then
+            echo "⚠️ pip-audit found issues" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ pip-audit passed" >> $GITHUB_STEP_SUMMARY
+          fi
+  
+  build:
+    name: Build Distribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [test, lint, type-check]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+      
+      - name: Build package
+        run: |
+          echo "::group::Building package"
+          uv build --verify-hashes
+          echo "::endgroup::"
+          
+          # Display package info
+          echo "## Build Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Package contents:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -lah dist/ >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        working-directory: crisp-py
+      
+      - name: Verify build
+        run: |
+          # Check wheel contents
+          python -m zipfile -l dist/*.whl | head -20
+          
+          # Verify package metadata
+          uv pip install check-wheel-contents twine
+          uv run check-wheel-contents dist/*.whl || true
+          uv run twine check dist/*
+        working-directory: crisp-py
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions
+          path: crisp-py/dist/
+          retention-days: 7
+  
+  all-checks-pass:
+    name: All Checks Pass
+    runs-on: ubuntu-latest
+    needs: [test, lint, type-check, security, build]
+    if: always()
+    
+    steps:
+      - name: Check job statuses
+        uses: re-actors/alls-green@release/v1
+        id: all-green
+        with:
+          jobs: ${{ toJSON(needs) }}
+      
+      - name: Create final summary
+        if: always()
+        run: |
+          echo "## CI Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.all-green.outcome }}" == "success" ]; then
+            echo "### ✅ All checks passed!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The code is ready to merge." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ Some checks failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Please review the failed jobs above." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Results:" >> $GITHUB_STEP_SUMMARY
+          echo "- Test: ${{ needs.test.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Lint: ${{ needs.lint.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Type Check: ${{ needs.type-check.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Security: ${{ needs.security.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Build: ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY

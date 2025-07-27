@@ -1,0 +1,155 @@
+name: Dependency Update
+
+on:
+  schedule:
+    # Run every Monday at 8:00 AM UTC
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+    inputs:
+      update-strategy:
+        description: 'Update strategy'
+        required: true
+        default: 'minor'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - latest
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-dependencies:
+    name: Update Dependencies
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      
+      - name: Create update branch
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git checkout -b deps/update-$(date +%Y%m%d-%H%M%S)
+      
+      - name: Update dependencies
+        run: |
+          # Update based on strategy
+          STRATEGY="${{ github.event.inputs.update-strategy || 'minor' }}"
+          
+          echo "Updating dependencies with strategy: $STRATEGY"
+          
+          case $STRATEGY in
+            patch)
+              # Update to latest patch versions
+              uv lock --upgrade-package "*"
+              ;;
+            minor)
+              # Update to latest minor versions (default)
+              uv lock --upgrade-package "*"
+              ;;
+            major)
+              # Update to latest major versions
+              uv lock --upgrade-package "*" --upgrade
+              ;;
+            latest)
+              # Update everything to latest
+              uv lock --upgrade
+              ;;
+          esac
+          
+          # Sync to ensure everything works
+          uv sync --all-extras --dev
+      
+      - name: Run tests
+        id: test
+        run: |
+          # Quick smoke test to ensure updates don't break everything
+          uv run pytest -v --tb=short || echo "tests-failed=true" >> $GITHUB_OUTPUT
+        continue-on-error: true
+      
+      - name: Generate dependency report
+        run: |
+          echo "# Dependency Update Report" > dependency-report.md
+          echo "" >> dependency-report.md
+          echo "Update strategy: ${{ github.event.inputs.update-strategy || 'minor' }}" >> dependency-report.md
+          echo "Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> dependency-report.md
+          echo "" >> dependency-report.md
+          
+          echo "## Changes" >> dependency-report.md
+          echo '```diff' >> dependency-report.md
+          git diff uv.lock | grep -E "^[+-]" | grep -v "^[+-]{3}" | head -100 >> dependency-report.md || true
+          echo '```' >> dependency-report.md
+          echo "" >> dependency-report.md
+          
+          if [ "${{ steps.test.outputs.tests-failed }}" == "true" ]; then
+            echo "⚠️ **Warning**: Some tests failed after the update. Please review carefully." >> dependency-report.md
+          else
+            echo "✅ All tests passed after the update." >> dependency-report.md
+          fi
+      
+      - name: Check for changes
+        id: check-changes
+        run: |
+          if git diff --quiet; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Commit and push changes
+        if: steps.check-changes.outputs.changed == 'true'
+        run: |
+          git add uv.lock
+          git commit -m "⬆️ Update dependencies (${{ github.event.inputs.update-strategy || 'minor' }} strategy)"
+          git push origin HEAD
+      
+      - name: Create Pull Request
+        if: steps.check-changes.outputs.changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('dependency-report.md', 'utf8');
+            
+            const pr = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `⬆️ Update dependencies (${context.payload.inputs?.['update-strategy'] || 'minor'} strategy)`,
+              head: `deps/update-${new Date().toISOString().slice(0,10).replace(/-/g,'')}`,
+              base: 'develop',
+              body: report + '\n\n---\n\nThis PR was automatically created by the dependency update workflow.',
+              draft: false
+            });
+            
+            // Add labels
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.data.number,
+              labels: ['dependencies', 'automated']
+            });
+            
+            console.log(`Created PR #${pr.data.number}: ${pr.data.html_url}`);
+      
+      - name: No updates needed
+        if: steps.check-changes.outputs.changed == 'false'
+        run: |
+          echo "✅ All dependencies are already up to date!"

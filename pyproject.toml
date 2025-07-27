@@ -1,0 +1,81 @@
+[project]
+name = "crisp-py"
+version = "0.1.0"
+description = "CRISP: Clustering Multi-Vector Representations for Denoising and Pruning"
+readme = "README.md"
+authors = [
+    { name = "sigridjineth", email = "sigrid.jinhyung@gmail.com" }
+]
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "einops>=0.8.1",
+    "faiss-cpu>=1.11.0.post1",
+    "numpy>=2.3.2",
+    "pytorch-lightning>=2.5.2",
+    "scikit-learn>=1.7.1",
+    "torch>=2.7.1",
+    "transformers>=4.54.0",
+    "tqdm>=4.65.0",
+    "jsonlines>=3.1.0",
+    "pandas>=1.5.0",
+    "beir>=1.0.1",
+    "tensorboard>=2.13.0",
+]
+
+[project.scripts]
+crisp-py = "crisp_py:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["crisp-py/crisp"]
+
+[dependency-groups]
+dev = [
+    "black>=25.1.0",
+    "isort>=6.0.1",
+    "mypy>=1.17.0",
+    "pytest>=8.4.1",
+    "pytest-cov>=6.2.1",
+    "pytest-xdist>=3.3.0",
+    "flake8>=6.0.0",
+    "sphinx>=6.0.0",
+    "sphinx-rtd-theme>=1.2.0",
+]
+# Note: faiss-gpu only supports Python <=3.10
+# gpu = [
+#     "faiss-gpu>=1.7.2",
+# ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
