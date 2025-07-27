@@ -1,9 +1,9 @@
-# CRISP: Clustering-Optimized Multi-Vector Representations for Efficient Retrieval
+# CRISP: Clustering Multi-Vector Representations for Denoising and Pruning
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A PyTorch implementation of **CRISP (Clustering-based Reduction of Instructions for Semantic Pruning)**, demonstrating how training with clustering awareness produces superior multi-vector representations compared to post-hoc clustering approaches.
+The unofficial PyTorch implementation of **CRISP (Clustering Multi-Vector Representations for Denoising and Pruning)**, demonstrating how training with clustering awareness produces superior multi-vector representations compared to post-hoc clustering approaches.
 
 ## Key Results
 
@@ -21,6 +21,9 @@ Our implementation shows that CRISP-trained models significantly outperform post
 ```bash
 ./examples/run_pipeline.sh --epochs 1 --train-samples 50
 ```
+
+![img.png](docs/img.png)
+![img_1.png](docs/img_1.png)
 
 <details>
 <summary>Click to see full output</summary>
@@ -70,8 +73,8 @@ KEY INSIGHTS:
 
 ## What is CRISP?
 
-CRISP is a novel approach to multi-vector retrieval that **trains models to produce cluster-friendly embeddings** from the start, rather than applying clustering as an afterthought. This results in:
-The paper from Google Deepmind is in [arxiv](arxiv.org/pdf/2505.11471).
+CRISP is a novel approach to multi-vector retrieval that **trains models to produce cluster-friendly embeddings** from the start, rather than applying clustering as an afterthought.
+Please consult with the official paper from Google Deepmind is in [arxiv](arxiv.org/pdf/2505.11471).
 
 ## Installation
 
@@ -181,20 +184,14 @@ This implementation is based on the CRISP paper.
 If you use this code in your research, please cite:
 
 ```bibtex
-@article{crisp2024,
-  title={CRISP: Clustering-based Reduction of Instructions for Semantic Pruning},
-  author={[Authors]},
-  journal={arXiv preprint arXiv:XXXX.XXXXX},
-  year={2024}
+@article{crisp2025,
+  title={CRISP: Clustering Multi-Vector Representations for Denoising and Pruning},
+  journal={arXiv:2505.11471v1},
+  year={2025}
 }
 ```
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-<p align="center">
-  Made with ❤️ for the IR community
-</p>
+Made with ❤️ for the IR community
